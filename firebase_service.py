@@ -7,12 +7,24 @@ Handles Firebase Realtime Database + Firebase Storage for lossless images
 import pyrebase
 import json
 import os
+import sys
 import random
 import string
 import base64
 import time
 import uuid
 import urllib.request
+
+
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    
+    return os.path.join(base_path, relative_path)
 
 
 class FirebaseService:
@@ -44,9 +56,9 @@ class FirebaseService:
     def connect(self):
         """Connect to Firebase"""
         try:
-            config_path = "firebase_config.json"
+            config_path = get_resource_path("firebase_config.json")
             if not os.path.exists(config_path):
-                print("firebase_config.json not found!")
+                print(f"firebase_config.json not found at {config_path}!")
                 return False
             
             with open(config_path, "r") as f:
@@ -136,6 +148,12 @@ class FirebaseService:
             return False
         
         try:
+            # CHECK: Do not upload if content already exists
+            existing_content = self.db.child("rooms").child(self.room_code).child("content").get()
+            if existing_content.val() is not None:
+                print("❌ Content already present in room - cannot upload")
+                return False
+            
             timestamp = int(time.time() * 1000)
             
             if content_type == "image":
@@ -182,7 +200,7 @@ class FirebaseService:
             return False
     
     def download_content(self):
-        """Download content from room"""
+        """Download content from room - accessible by ANY device in the room"""
         if not self.connected or not self.room_code:
             return None
         
@@ -195,6 +213,13 @@ class FirebaseService:
                 return None
             
             content_type = content_data.get("type")
+            uploaded_by = content_data.get("uploaded_by", "unknown")
+            
+            # Log cross-device transfer
+            if uploaded_by != self.device_id:
+                print(f"📥 Receiving content from device: {uploaded_by}")
+            else:
+                print(f"📥 Receiving own content")
             
             if content_type == "image":
                 download_url = content_data.get("download_url")
@@ -272,56 +297,6 @@ class FirebaseService:
                 print(f"Storage delete error ({e.code}): {e.reason}")
         except Exception as e:
             print(f"Storage delete warning: {e}")
-        except Exception as e:
-            # Pyrebase may not support delete - use REST API
-            print(f"Storage delete note: {e}")
-    
-    def clear_room_content(self):
-        """Clear content from room"""
-        if not self.connected or not self.room_code:
-            return False
-        
-        try:
-            self.db.child("rooms").child(self.room_code).child("content").remove()
-            return True
-        except Exception as e:
-            print(f"Clear error: {e}")
-            return False
-            
-            if not content_data:
-                print("No content in room")
-                return None
-            
-            content_type = content_data.get("type")
-            
-            if content_type == "image":
-                # Decode base64 image
-                encoded = content_data.get("data")
-                if encoded:
-                    image_data = base64.b64decode(encoded)
-                    print(f"Image downloaded: {len(image_data)/1024:.1f} KB")
-                    return {
-                        "type": "image",
-                        "data": image_data,
-                        "raw_bytes": True
-                    }
-                else:
-                    print("No image data found")
-                    return None
-                    
-            elif content_type == "text":
-                return {
-                    "type": "text",
-                    "data": content_data.get("data", "")
-                }
-            
-            return content_data
-            
-        except Exception as e:
-            print(f"Download error: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
     
     def clear_room_content(self):
         """Clear content from room"""

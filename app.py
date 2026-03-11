@@ -13,6 +13,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import urllib.request
 import os
+import sys
 import time
 import base64
 import threading
@@ -27,6 +28,17 @@ from tkinter import filedialog
 
 # Import Firebase service
 from firebase_service import FirebaseService
+
+
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    
+    return os.path.join(base_path, relative_path)
 
 # Set appearance
 ctk.set_appearance_mode("dark")
@@ -76,7 +88,7 @@ class HandGestureDetector:
         self.finger_count = 0
     
     def _ensure_model(self):
-        model_path = "hand_landmarker.task"
+        model_path = get_resource_path("hand_landmarker.task")
         if not os.path.exists(model_path):
             print("Downloading hand landmarker model...")
             url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
@@ -256,15 +268,20 @@ class HandCopyPasteApp(ctk.CTk):
         
         # Load settings
         self.settings_file = "settings.json"
-        self.save_folder = self._load_settings().get("save_folder", os.getcwd())
+        settings = self._load_settings()
+        self.save_folder = settings.get("save_folder", os.getcwd())
+        self.last_room = settings.get("last_room", None)
         
         # Processing state
         self.is_processing = False
         
+        # Periodic content check
+        self.content_check_timer = None
+        
         # Create UI
         self._create_ui()
         
-        # Connect to Firebase
+        # Connect to Firebase and auto-rejoin last room
         self._connect_firebase()
         
         # Start camera
@@ -501,6 +518,9 @@ class HandCopyPasteApp(ctk.CTk):
                     text="● Connected",
                     text_color="#00d4aa"
                 ))
+                # Auto-rejoin last room
+                if self.last_room:
+                    self.after(100, lambda: self._auto_rejoin_room(self.last_room))
             else:
                 self.after(0, lambda: self.status_indicator.configure(
                     text="● Offline",
@@ -508,6 +528,60 @@ class HandCopyPasteApp(ctk.CTk):
                 ))
         
         threading.Thread(target=connect, daemon=True).start()
+    
+    def _auto_rejoin_room(self, room_code):
+        """Automatically rejoin the last room"""
+        if self.firebase.join_room(room_code):
+            self.room_code = room_code
+            self.room_code_label.configure(text=room_code, text_color="#00d4aa")
+            self._generate_qr(room_code)
+            self._add_history("Auto-joined", f"Room {room_code}")
+            # Start periodic content checking
+            self._start_periodic_content_check()
+        else:
+            # Room no longer exists, clear saved room
+            self.last_room = None
+            self._save_settings()
+            self._add_history("Info", "Previous room expired")
+    
+    def _check_and_sync_content_state(self):
+        """Check if content exists in room and sync gesture state"""
+        def check_content():
+            try:
+                # Check if content exists in Firebase
+                content = self.firebase.db.child("rooms").child(self.room_code).child("content").get()
+                has_content = content.val() is not None
+                
+                # Update gesture state on main thread
+                self.after(0, lambda: self._update_holding_state(has_content))
+            except Exception as e:
+                print(f"Content check error: {e}")
+        
+        threading.Thread(target=check_content, daemon=True).start()
+    
+    def _update_holding_state(self, has_content):
+        """Update gesture holding state based on room content"""
+        if has_content:
+            self.gesture_detector.is_holding = True
+            self.gesture_detector.confirmed_state = self.gesture_detector.CLOSED_FIST
+            self._add_history("Info", "Content available - open palm to receive")
+            print("📦 Content detected in room - ready to DROP")
+        else:
+            self.gesture_detector.is_holding = False
+            self.gesture_detector.confirmed_state = self.gesture_detector.UNKNOWN
+    
+    def _start_periodic_content_check(self):
+        """Start periodic content checking every 2 seconds"""
+        if self.room_code:
+            self._check_and_sync_content_state()
+            # Schedule next check in 2 seconds
+            self.content_check_timer = self.after(2000, self._start_periodic_content_check)
+    
+    def _stop_periodic_content_check(self):
+        """Stop periodic content checking"""
+        if self.content_check_timer:
+            self.after_cancel(self.content_check_timer)
+            self.content_check_timer = None
     
     def _start_camera(self):
         """Start camera capture"""
@@ -620,6 +694,8 @@ class HandCopyPasteApp(ctk.CTk):
             self.room_code_label.configure(text=room_code, text_color="#00d4aa")
             self._generate_qr(room_code)
             self._add_history("Room created", room_code)
+            self._save_settings()  # Remember this room
+            self._start_periodic_content_check()  # Start checking for content
         else:
             self._show_message("Failed to create room")
     
@@ -649,6 +725,8 @@ class HandCopyPasteApp(ctk.CTk):
             self.room_code_label.configure(text=code, text_color="#00d4aa")
             self._generate_qr(code)
             self._add_history("Joined room", code)
+            self._save_settings()  # Remember this room
+            self._start_periodic_content_check()  # Start checking for content
         else:
             self._show_message("Failed to join room")
     
@@ -720,8 +798,10 @@ class HandCopyPasteApp(ctk.CTk):
         if success:
             self._add_history("GRAB", f"{content_type} uploaded ✓")
             self._update_preview(content)
+            # Set holding state after successful upload
+            self.gesture_detector.is_holding = True
         else:
-            self._add_history("GRAB", f"Upload failed ✗")
+            self._add_history("GRAB", "Upload blocked - content already in room")
     
     def _on_text_upload_complete(self, success, text):
         """Called when text upload finishes"""
@@ -732,7 +812,7 @@ class HandCopyPasteApp(ctk.CTk):
             self._add_history("GRAB", f"Text: {text[:30]}... ✓")
             self.preview_label.configure(text=f"📋 {text[:50]}...")
         else:
-            self._add_history("GRAB", "Text upload failed ✗")
+            self._add_history("GRAB", "Upload blocked - content already in room")
     
     def _on_upload_error(self, error):
         """Called when upload has an error"""
@@ -763,7 +843,7 @@ class HandCopyPasteApp(ctk.CTk):
         threading.Thread(target=download_task, daemon=True).start()
     
     def _on_download_complete(self, content_data):
-        """Called when download finishes"""
+        """Called when download finishes - works even after app restart"""
         self.is_processing = False
         self._hide_processing()
         
@@ -805,6 +885,9 @@ class HandCopyPasteApp(ctk.CTk):
                     # Open the image
                     self._open_file(filepath)
                     
+                    # Reset holding state after successful download
+                    self.gesture_detector.is_holding = False
+                    
                 except Exception as e:
                     self._add_history("DROP", f"Error: {e}")
             
@@ -813,6 +896,8 @@ class HandCopyPasteApp(ctk.CTk):
                 pyperclip.copy(text)
                 self._add_history("DROP", f"Copied: {text[:30]}... ✓")
                 self.preview_label.configure(text=f"📋 {text[:50]}...")
+                # Reset holding state after successful download
+                self.gesture_detector.is_holding = False
         else:
             self._add_history("DROP", "No content available")
     
@@ -913,7 +998,8 @@ class HandCopyPasteApp(ctk.CTk):
         """Save settings to file"""
         try:
             settings = {
-                "save_folder": self.save_folder
+                "save_folder": self.save_folder,
+                "last_room": self.room_code
             }
             with open(self.settings_file, "w") as f:
                 json.dump(settings, f, indent=2)
@@ -955,6 +1041,7 @@ class HandCopyPasteApp(ctk.CTk):
     def _on_close(self):
         """Handle window close"""
         self.running = False
+        self._stop_periodic_content_check()
         if self.cap:
             self.cap.release()
         self.firebase.disconnect()
